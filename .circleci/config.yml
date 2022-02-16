@@ -5,6 +5,15 @@ version: 2.1
 # Define a job to be invoked later in a workflow.
 # See: https://circleci.com/docs/2.0/configuration-reference/#jobs
 jobs:
+  order-one:
+    docker:
+      - image: cimg/python:3.8
+    steps:
+      - checkout
+      - run:
+          name: "Order One"
+          command: echo "Order One"
+          
   start-up:
     # Specify the execution environment. You can specify an image from Dockerhub or use one of our Convenience Images from CircleCI's Developer Hub.
     # See: https://circleci.com/docs/2.0/configuration-reference/#docker-machine-macos-windows-executor
@@ -17,14 +26,6 @@ jobs:
       - run:
           name: "Say it"
           command: echo "Start Up"
-  order-one:
-    docker:
-      - image: cimg/python:3.8
-    steps:
-      - checkout
-      - run:
-          name: "Order One"
-          command: echo "Order One"
 
 
 # Invoke jobs via workflows
