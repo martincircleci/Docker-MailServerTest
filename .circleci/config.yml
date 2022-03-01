@@ -1,21 +1,13 @@
 version: 2.1
-orbs:
-  android: circleci/android@1.0.3
+
 jobs:
-  build-and-test:
-    executor:
-      name: android/android-machine
+  build:
+    docker:
+      - image: cimg/python:3.9.5-node
     steps:
       - checkout
       - run:
-          name: Message
-          command: echo "Only Master"
-
-workflows:
-  sample:
-    jobs:
-      - build-and-test:
-          filters:
-            branches:
-              only:
-                - master
+          name: Install
+          command: |
+            sudo apt-get update
+            sudo apt-get install python-dev libjpeg-dev libfreetype6-dev zlib1g-dev python-dev build-essential
