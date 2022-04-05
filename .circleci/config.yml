@@ -1,7 +1,2539 @@
 version: 2.1
+
+parameters:
+  deploy_mt_service:
+    # deploy_mt_service triggers a deploy to mt stage env for a given MT service (used by all MT services)
+    type: boolean
+    default: false
+  service_name:
+    # service_name is the name of the mt service to deploy
+    type: string
+    default: ""
+  service_version:
+    # service_version is the version of the mt service to deploy
+    type: string
+    default: ""
+  deploy_mt_proxy:
+    # deploy_mt_proxy triggers a deploy of the mt-proxy service to the st dev k8s cluster
+    type: boolean
+    default: false
+
+##
+# Initialize the Blameless CICD Orb + CircleCI slack integration Orb
+##
+orbs:
+  blameless-cicd: blamelesstest/blameless-cicd@dev:v1.0
+  slack: circleci/slack@4.2.0
+  sumologic: circleci/sumologic@1.1.0
+
+##
+# Executors
+##
+default_job_args: &default_job_args
+  primary_image: gcr.io/blameless-185322/blameless-ci
+  primary_tag: 3.13-16
+  context: ci_builds
+
+default_executor: &default_executor
+  docker:
+    - image: gcr.io/blameless-185322/blameless-ci:3.13-16
+      auth:
+        username: _json_key
+        password: $GOOGLE_SA_KEY
+
+e2e_test_executor: &e2e_test_executor
+  docker:
+    - image: gcr.io/blameless-185322/cypress:12
+      auth:
+        username: _json_key
+        password: $GOOGLE_SA_KEY
+
+###
+#  Common commands used throughout this config
+###
+
+#
+# Command to establish connection to cluster no private network
+# and deploy Blameless
+#
+deploy_private: &deploy_private
+  <<: *default_executor
+  steps:
+    - checkout
+    - blameless-cicd/configure-gcloud
+    - blameless-cicd/configure-kube-access:
+        gcp_kms_key: ${KMS_DEPLOY_KEY}
+        kube_config: ./deployment/config/kube-config.json
+        ssh_config: ./deployment/config/ssh-config.json
+        ssh_key: ./deployment/config/id_rsa_circleci.json
+        provider: ${PROVIDER}
+        environment: ${CLUSTER_ENV}
+        region: ${CLUSTER_REGION}
+        cluster_ip: ${CLUSTER_IP}
+        cluster_context: ${KUBE_CLUSTER_ENTRY}
+    - run:
+        name: Deploy to cluster
+        command: |
+          ./deployment/scripts/release_cluster.sh -C ${KUBE_CLUSTER_ENTRY} \
+                                                  -V ${INSTANCE_VALUES_DIR} \
+                                                  -n ${RELEASE_NAME} \
+                                                  -w ${BLAMELESS_CIRCLECI_WEBHOOK} \
+                                                  -j ${CIRCLE_BUILD_NUM} \
+                                                  -u ${CIRCLE_BUILD_URL} \
+                                                  -d ./deployment/config/deployment.json
+
+#
+# Command to establish connection to cluster on private network
+# and deploy multitenant services
+#
+deploy_private_multitenant_services: &deploy_private_multitenant_services
+  <<: *default_executor
+  steps:
+    - checkout
+    - blameless-cicd/configure-gcloud
+    - blameless-cicd/configure-kube-access:
+        gcp_kms_key: ${KMS_DEPLOY_KEY}
+        kube_config: ./deployment/config/kube-config.json
+        ssh_config: ./deployment/config/ssh-config.json
+        ssh_key: ./deployment/config/id_rsa_circleci.json
+        provider: ${PROVIDER}
+        environment: ${CLUSTER_ENV}
+        region: ${CLUSTER_REGION}
+        cluster_ip: ${CLUSTER_IP}
+        cluster_context: ${KUBE_CLUSTER_ENTRY}
+    - when:
+        condition: << pipeline.parameters.deploy_mt_service >>
+        steps:
+          - run:
+              name: Deploy a multitenant service to mt cluster
+              command: |
+                ./deployment/scripts/deploy_mt_service.sh   -C ${KUBE_CLUSTER_ENTRY} \
+                                                            -L ${INSTANCE_VALUES_DIR} \
+                                                            -s << pipeline.parameters.service_name >> \
+                                                            -v << pipeline.parameters.service_version >>
+          - slack/notify:
+              channel: reliability
+              event: fail
+              custom: |
+                {
+                  "blocks": [
+                    {
+                      "type": "header",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "<< pipeline.parameters.service_name >> MT Deploy Failed! :elmofire:",
+                        "emoji": true
+                      }
+                    },
+                    {
+                      "type": "section",
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Project*:\n${CIRCLE_PROJECT_REPONAME}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*When*:\n$(date +'%m/%d/%Y %T')"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Env*:\n${CLUSTER_ENV}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Version*:\n<< pipeline.parameters.service_version >>"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Job"
+                          },
+                          "url": "${CIRCLE_BUILD_URL}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+          - slack/notify:
+              channel: reliability
+              event: pass
+              custom: |
+                {
+                  "blocks": [
+                    {
+                      "type": "header",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "<< pipeline.parameters.service_name >> MT Deploy Successful! :tada:",
+                        "emoji": true
+                      }
+                    },
+                    {
+                      "type": "section",
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Project*:\n${CIRCLE_PROJECT_REPONAME}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*When*:\n$(date +'%m/%d/%Y %T')"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Env*:\n${CLUSTER_ENV}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Version*:\n<< pipeline.parameters.service_version >>"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Job"
+                          },
+                          "url": "${CIRCLE_BUILD_URL}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+
+#
+# Command to establish connection to cluster on private network
+# and deploy mt-proxy service
+# (mt-proxy service has its own deploy pipeline, because its not a ST service or a MT service)
+#
+deploy_private_mt_proxy: &deploy_private_mt_proxy
+  <<: *default_executor
+  steps:
+    - checkout
+    - blameless-cicd/configure-gcloud
+    - blameless-cicd/configure-kube-access:
+        gcp_kms_key: ${KMS_DEPLOY_KEY}
+        kube_config: ./deployment/config/kube-config.json
+        ssh_config: ./deployment/config/ssh-config.json
+        ssh_key: ./deployment/config/id_rsa_circleci.json
+        provider: ${PROVIDER}
+        environment: ${CLUSTER_ENV}
+        region: ${CLUSTER_REGION}
+        cluster_ip: ${CLUSTER_IP}
+        cluster_context: ${KUBE_CLUSTER_ENTRY}
+    - when:
+        condition: << pipeline.parameters.deploy_mt_proxy >>
+        steps:
+          - run:
+              name: Deploy mt-proxy service to st cluster
+              command: |
+                ./deployment/scripts/deploy_mt_proxy_service.sh   -C ${KUBE_CLUSTER_ENTRY} \
+                                                                  -L ${INSTANCE_VALUES_DIR} \
+                                                                  -v << pipeline.parameters.service_version >>
+          - slack/notify:
+              channel: reliability
+              event: fail
+              custom: |
+                {
+                  "blocks": [
+                    {
+                      "type": "header",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "MT-Proxy Deploy Failed! :elmofire:",
+                        "emoji": true
+                      }
+                    },
+                    {
+                      "type": "section",
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Project*:\n${CIRCLE_PROJECT_REPONAME}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*When*:\n$(date +'%m/%d/%Y %T')"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Env*:\n${CLUSTER_ENV}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Version*:\n<< pipeline.parameters.service_version >>"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Job"
+                          },
+                          "url": "${CIRCLE_BUILD_URL}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+          - slack/notify:
+              channel: reliability
+              event: pass
+              custom: |
+                {
+                  "blocks": [
+                    {
+                      "type": "header",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "MT-Proxy Deploy Successful! :tada:",
+                        "emoji": true
+                      }
+                    },
+                    {
+                      "type": "section",
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Project*:\n${CIRCLE_PROJECT_REPONAME}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*When*:\n$(date +'%m/%d/%Y %T')"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Env*:\n${CLUSTER_ENV}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Version*:\n<< pipeline.parameters.service_version >>"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": "View Job"
+                          },
+                          "url": "${CIRCLE_BUILD_URL}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+
+##
+# Commands used to establish ordering between jobs
+##
+dev_wf_defaults: &dev_wf_defaults
+  requires:
+    - test_helm_versions
+  filters:
+    branches:
+      only:
+        - master
+  context: ci_builds
+
+hold_wf_defaults: &hold_wf_defaults
+  requires:
+    - blamelesscre
+    - hold-blameless
+  type: approval
+  filters:
+    branches:
+      only:
+        - master
+
+hold_ha_wf_defaults: &hold_ha_wf_defaults
+  requires:
+    - blamelesscre
+    - hold
+  type: approval
+  filters:
+    branches:
+      only:
+        - master
+
+prod_wf_defaults: &prod_wf_defaults
+  requires:
+    - hold
+  filters:
+    branches:
+      only: master
+  context: ci_builds
+
+prod_wf_defaults_ha: &prod_wf_defaults_ha
+  requires:
+    - hold-ha
+  filters:
+    branches:
+      only: master
+  context: ci_builds
+
+hold_cre_wf_defaults: &hold_cre_wf_defaults
+  requires:
+    # Add this back in when the tests are stable
+    # - test-check
+    - blamelessdev
+    - test_helm_versions
+  type: approval
+  filters:
+    branches:
+      only:
+        - master
+
+hold_blameless_wf_defaults: &hold_blameless_wf_defaults
+  requires:
+    - blamelesscre
+  type: approval
+  filters:
+    branches:
+      only:
+        - master
+
+cre_wf_defaults: &cre_wf_defaults
+  requires:
+    - hold-cre
+  filters:
+    branches:
+      only:
+        - master
+  context: ci_builds
+
+blameless_wf_defaults: &blameless_wf_defaults
+  requires:
+    - hold-blameless
+  filters:
+    branches:
+      only:
+        - master
+  context: ci_builds
+
+mt_service_wf_defaults: &mt_service_wf_defaults
+  requires:
+    - hold-mt-prod
+  filters:
+    branches:
+      only:
+        - master
+  context: ci_builds
+
+devcommon0_wf_defaults: &devcommon0_wf_defaults
+  requires:
+    - hold-devcommon0
+  context: ci_builds
+
+devcommon1_wf_defaults: &devcommon1_wf_defaults
+  requires:
+    - hold-devcommon1
+  context: ci_builds
+
+devcommon2_wf_defaults: &devcommon2_wf_defaults
+  requires:
+    - hold-devcommon2
+  context: ci_builds
+
+devcommon3_wf_defaults: &devcommon3_wf_defaults
+  requires:
+    - hold-devcommon3
+  context: ci_builds
+
+devcommon4_wf_defaults: &devcommon4_wf_defaults
+  requires:
+    - hold-devcommon4
+  context: ci_builds
+
+devcommon5_wf_defaults: &devcommon5_wf_defaults
+  requires:
+    - hold-devcommon5
+  context: ci_builds
+  
+devcommon6_wf_defaults: &devcommon6_wf_defaults
+  requires:
+    - hold-devcommon6
+  context: ci_builds
+
+mt_proxy_wf_defaults: &mt_proxy_wf_defaults
+  requires:
+    - hold-mt-proxy-prod
+  filters:
+    branches:
+      only:
+        - master
+  context: ci_builds
+
+hold_mt_service_wf_defaults: &hold_mt_service_wf_defaults
+  requires:
+    - multitenant-service-dev
+  type: approval
+  filters:
+    branches:
+      only:
+        - master
+  context: ci_builds
+
+hold_mt_proxy_wf_defaults: &hold_mt_proxy_wf_defaults
+  requires:
+    - multitenant-mt-proxy-dev-a
+    - multitenant-mt-proxy-dev-multitenant
+  type: approval
+  filters:
+    branches:
+      only:
+        - master
+  context: ci_builds
+
+hold_devcommon0_wf_defaults: &hold_devcommon0_wf_defaults
+  # This hold needs a job to reference, so by default we will
+  # have it test helm versions, since we don't want auto
+  # deploy to a dev environment.
+  requires:
+    - test_helm_versions
+  type: approval
+  context: ci_builds
+
+hold_devcommon1_wf_defaults: &hold_devcommon1_wf_defaults
+  # This hold needs a job to reference, so by default we will
+  # have it test helm versions, since we don't want auto
+  # deploy to a dev environment.
+  requires:
+    - test_helm_versions
+  type: approval
+  context: ci_builds
+
+hold_devcommon2_wf_defaults: &hold_devcommon2_wf_defaults
+  # This hold needs a job to reference, so by default we will
+  # have it test helm versions, since we don't want auto
+  # deploy to a dev environment.
+  requires:
+    - test_helm_versions
+  type: approval
+  context: ci_builds
+
+hold_devcommon3_wf_defaults: &hold_devcommon3_wf_defaults
+  # This hold needs a job to reference, so by default we will
+  # have it test helm versions, since we don't want auto
+  # deploy to a dev environment.
+  requires:
+    - test_helm_versions
+  type: approval
+  context: ci_builds
+
+hold_devcommon4_wf_defaults: &hold_devcommon4_wf_defaults
+  # This hold needs a job to reference, so by default we will
+  # have it test helm versions, since we don't want auto
+  # deploy to a dev environment.
+  requires:
+    - test_helm_versions
+  type: approval
+  context: ci_builds
+
+hold_devcommon5_wf_defaults: &hold_devcommon5_wf_defaults
+  # This hold needs a job to reference, so by default we will
+  # have it test helm versions, since we don't want auto
+  # deploy to a dev environment.
+  requires:
+    - test_helm_versions
+  type: approval
+  context: ci_builds
+  
+hold_devcommon6_wf_defaults: &hold_devcommon6_wf_defaults
+  # This hold needs a job to reference, so by default we will
+  # have it test helm versions, since we don't want auto
+  # deploy to a dev environment.
+  requires:
+    - test_helm_versions
+  type: approval
+  context: ci_builds
+
+###
+# Job definitions used in the workflows for this config
+###
 jobs:
-  my-job:
-    machine:
-      image: ubuntu-2004:202201-02
+  test_helm_versions: &test_helm_versions
+    <<: *default_executor
     steps:
-      run: python --version
+      - checkout
+      - blameless-cicd/configure-gcloud
+      - run:
+          name: Verifying whether charts are valid and each version exists
+          command: ./deployment/scripts/check_if_chart_exist.sh -d ./deployment/config/deployment.json
+
+  # Multitenant deploys
+  multitenant-service-dev:
+    environment:
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_mt-dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_mt-dev-us-central1-private-a
+      CLUSTER_ENV: mt-dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.3.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private_multitenant_services
+
+  multitenant-mt-proxy-dev-a:
+    # mt-proxy service deployment for the st dev a cluster
+    environment:
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-a_mt-proxy
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private_mt_proxy
+
+  multitenant-mt-proxy-dev-multitenant:
+    # mt-proxy service deployment for the st dev "multitenant" cluster
+    # (NOTE: this is still ST, we call it  "multitenant" for confusing historical reasons)
+    environment:
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-multitenant
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-multitenant_mt-proxy
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private_mt_proxy
+
+  multitenant-mt-proxy-prod-a:
+    # mt-proxy service deployment to the st prod a cluster
+    environment:
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_mt-proxy
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private_mt_proxy
+
+  multitenant-mt-proxy-prod-b:
+    # mt-proxy service deployment to the st prod a cluster
+    environment:
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_mt-proxy
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private_mt_proxy
+
+  multitenant-mt-proxy-prod-c:
+    # mt-proxy service deployment to the st prod a cluster
+    environment:
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_mt-proxy
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private_mt_proxy
+
+  multitenant-mt-proxy-prod-europe-west4-a:
+    # mt-proxy service deployment to the st prod a cluster
+    environment:
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_mt-proxy
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private_mt_proxy
+
+  multitenant-mt-proxy-prod-asia-northeast1-a:
+    # mt-proxy service deployment to the st prod a cluster
+    environment:
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_asia-northeast1_prod-asia-northeast1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-asia-northeast1-private-a_mt-proxy
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: asia-northeast1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private_mt_proxy
+
+  multitenant-service-prod-us-central1:
+    environment:
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_mt-prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_mt-prod-us-central1-private-a
+      CLUSTER_ENV: mt-prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.5.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private_multitenant_services
+
+  multitenant-service-prod-europe-west4:
+    environment:
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_mt-prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_mt-prod-europe-west4-private-a
+      CLUSTER_ENV: mt-prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.1.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private_multitenant_services
+
+  multitenant-service-prod-asia-northeast1:
+    environment:
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_asia-northeast1_mt-prod-asia-northeast1-private-a
+      INSTANCE_VALUES_DIR: gke_mt-prod-asia-northeast1-private-a
+      CLUSTER_ENV: mt-prod
+      PROVIDER: gcp
+      CLUSTER_REGION: asia-northeast1
+      CLUSTER_IP: 172.16.1.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private_multitenant_services
+
+  # Instance deploy jobs
+  blameless:
+    environment:
+      RELEASE_NAME: "blameless"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_blameless
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  blamelesscre:
+    environment:
+      RELEASE_NAME: "blamelesscre"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_blamelesscre
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  blamelesstrial:
+    environment:
+      RELEASE_NAME: "blamelesstrial"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_blamelesstrial
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+      BEKI_ENABLED: true
+    <<: *deploy_private
+  blamelessdev:
+    environment:
+      RELEASE_NAME: "blamelessdev"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-multitenant
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-multitenant_blamelessdev
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+      BEKI_ENABLED: true
+    <<: *deploy_private
+  iterable:
+    environment:
+      RELEASE_NAME: "iterable"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_iterable
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  masterclass:
+    environment:
+      RELEASE_NAME: "masterclass"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_masterclass
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  packet:
+    environment:
+      RELEASE_NAME: "packet"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_packet
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  procore:
+    environment:
+      RELEASE_NAME: "procore"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_procore
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  platform9:
+    environment:
+      RELEASE_NAME: "platform9"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_platform9
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  tenable:
+    environment:
+      RELEASE_NAME: "tenable"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-tenable
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-singletenant_tenable
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.1.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  homedepot:
+    environment:
+      RELEASE_NAME: "homedepot"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_homedepot
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  fox:
+    environment:
+      RELEASE_NAME: "fox"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_fox
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  eventbrite:
+    environment:
+      RELEASE_NAME: "eventbrite"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_eventbrite
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  underarmour:
+    environment:
+      RELEASE_NAME: "underarmour"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_underarmour
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  datarobot:
+    environment:
+      RELEASE_NAME: "datarobot"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_datarobot
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  mambu:
+    environment:
+      RELEASE_NAME: "mambu"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_mambu
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  addepar:
+    environment:
+      RELEASE_NAME: "addepar"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_addepar
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  earnin:
+    environment:
+      RELEASE_NAME: "earnin"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_earnin
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  flywire:
+    environment:
+      RELEASE_NAME: "flywire"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_flywire
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  vestiairecollective:
+    environment:
+      RELEASE_NAME: "vestiairecollective"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_vestiairecollective
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  demo:
+    environment:
+      RELEASE_NAME: "demo"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_demo
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  acs:
+    environment:
+      RELEASE_NAME: "acs"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_acs
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  missionlane:
+    environment:
+      RELEASE_NAME: "missionlane"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_missionlane
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  citrix:
+    environment:
+      RELEASE_NAME: "citrix"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_citrix
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  mercari-sandbox:
+    environment:
+      RELEASE_NAME: "mercari-sandbox"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_asia-northeast1_prod-asia-northeast1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-asia-northeast1-private-a_mercari-sandbox
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: asia-northeast1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  mercari:
+    environment:
+      RELEASE_NAME: "mercari"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_asia-northeast1_prod-asia-northeast1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-asia-northeast1-private-a_mercari
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: asia-northeast1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  gojek:
+    environment:
+      RELEASE_NAME: "gojek"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_asia-northeast1_prod-asia-northeast1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-asia-northeast1-private-a_gojek
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: asia-northeast1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  softwareag:
+    environment:
+      RELEASE_NAME: "softwareag"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_asia-northeast1_prod-asia-northeast1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-asia-northeast1-private-a_softwareag
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: asia-northeast1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  sostronk:
+    environment:
+      RELEASE_NAME: "sostronk"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_asia-northeast1_prod-asia-northeast1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-asia-northeast1-private-a_sostronk
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: asia-northeast1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  greenlight:
+    environment:
+      RELEASE_NAME: "greenlight"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_greenlight
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  gremlin:
+    environment:
+      RELEASE_NAME: "gremlin"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_gremlin
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  zapier:
+    environment:
+      RELEASE_NAME: "zapier"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_zapier
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  inloco:
+    environment:
+      RELEASE_NAME: "inloco"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_inloco
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  mux:
+    environment:
+      RELEASE_NAME: "mux"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-multitenant_mux
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  flatiron:
+    environment:
+      RELEASE_NAME: "flatiron"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_flatiron
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  ticketmaster:
+    environment:
+      RELEASE_NAME: "ticketmaster"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_ticketmaster
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  gtm-blameless:
+    environment:
+      RELEASE_NAME: "gtm-blameless"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_gtm-blameless
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  codeclimate:
+    environment:
+      RELEASE_NAME: "codeclimate"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_codeclimate
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  leolabs:
+    environment:
+      RELEASE_NAME: "leolabs"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_leolabs
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  salesboomerang:
+    environment:
+      RELEASE_NAME: "salesboomerang"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_salesboomerang
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  microsoft:
+    environment:
+      RELEASE_NAME: "microsoft"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_microsoft
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  vimeo:
+    environment:
+      RELEASE_NAME: "vimeo"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_vimeo
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  phreesia:
+    environment:
+      RELEASE_NAME: "phreesia"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_phreesia
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  galaxydigital:
+    environment:
+      RELEASE_NAME: "galaxydigital"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_galaxydigital
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  paypay:
+    environment:
+      RELEASE_NAME: "paypay"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_paypay
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  snyk:
+    environment:
+      RELEASE_NAME: "snyk"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_snyk
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  hashicorp:
+    environment:
+      RELEASE_NAME: "hashicorp"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_hashicorp
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  revops:
+    environment:
+      RELEASE_NAME: "revops"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_revops
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  zoopla:
+    environment:
+      RELEASE_NAME: "zoopla"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_zoopla
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  fast:
+    environment:
+      RELEASE_NAME: "fast"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_fast
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  hitachisolutions:
+    environment:
+      RELEASE_NAME: "hitachisolutions"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-a_hitachisolutions
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  crowdstrike:
+    environment:
+      RELEASE_NAME: "crowdstrike"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_crowdstrike
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  markley:
+    environment:
+      RELEASE_NAME: "markley"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_markley
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  afterpay:
+    environment:
+      RELEASE_NAME: "afterpay"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_afterpay
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  cultureamp:
+    environment:
+      RELEASE_NAME: "cultureamp"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_cultureamp
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  petalcard:
+    environment:
+      RELEASE_NAME: "petalcard"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_petalcard
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  paloaltonetworks:
+    environment:
+      RELEASE_NAME: "paloaltonetworks"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_paloaltonetworks
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  stitchfix:
+    environment:
+      RELEASE_NAME: "stitchfix"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_stitchfix
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  dremio:
+    environment:
+      RELEASE_NAME: "dremio"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_dremio
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  sadapay:
+    environment:
+      RELEASE_NAME: "sadapay"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_sadapay
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  glovoapp:
+    environment:
+      RELEASE_NAME: "glovoapp"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_glovoapp
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  load-test:
+    environment:
+      RELEASE_NAME: "load-test"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-multitenant_load-test
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+      BEKI_ENABLED: true
+    <<: *deploy_private
+  devcommon-0:
+    environment:
+      RELEASE_NAME: "devcommon-0"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-a_devcommon-0
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private 
+  devcommon-1:
+    environment:
+      RELEASE_NAME: "devcommon-1"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-a_devcommon-1
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  devcommon-2:
+    resource_class: large
+    environment:
+      RELEASE_NAME: "devcommon-2"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-a_devcommon-2
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  devcommon-3:
+    environment:
+      RELEASE_NAME: "devcommon-3"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-a_devcommon-3
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private 
+  devcommon-4:
+    environment:
+      RELEASE_NAME: "devcommon-4"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-a_devcommon-4
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  devcommon-5:
+    environment:
+      RELEASE_NAME: "devcommon-5"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-a_devcommon-5
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private 
+  devcommon-6:
+    environment:
+      RELEASE_NAME: "devcommon-6"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-a_devcommon-6
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private 
+  testautomation:
+    environment:
+      RELEASE_NAME: "testautomation"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-a_testautomation
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  mt-testing:
+    environment:
+      RELEASE_NAME: "mt-testing"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-a_mt-testing
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  msteams:
+    environment:
+      RELEASE_NAME: "msteams"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_dev-us-central1-private-a
+      INSTANCE_VALUES_DIR: gke_dev-us-central1-private-a_msteams
+      CLUSTER_ENV: dev
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.2.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  rainbowq:
+    environment:
+      RELEASE_NAME: "rainbowq"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_rainbowq
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  myfitnesspal:
+    environment:
+      RELEASE_NAME: "myfitnesspal"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_myfitnesspal
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  benevity:
+    environment:
+      RELEASE_NAME: "benevity"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_benevity
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  agero:
+    environment:
+      RELEASE_NAME: "agero"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_agero
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  newrelic:
+    environment:
+      RELEASE_NAME: "newrelic"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_newrelic
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  sezzle:
+    environment:
+      RELEASE_NAME: "sezzle"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_sezzle
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  delixus:
+    environment:
+      RELEASE_NAME: "delixus"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_delixus
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  ifood:
+    environment:
+      RELEASE_NAME: "ifood"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_ifood
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  bolt:
+    environment:
+      RELEASE_NAME: "bolt"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_bolt
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  fieldnation:
+    environment:
+      RELEASE_NAME: "fieldnation"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_fieldnation
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  vmware:
+    environment:
+      RELEASE_NAME: "vmware"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_vmware
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  att:
+    environment:
+      RELEASE_NAME: "att"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_att
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  sailpoint:
+    environment:
+      RELEASE_NAME: "sailpoint"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_sailpoint
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  sleuth:
+    environment:
+      RELEASE_NAME: "sleuth"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_sleuth
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  zerohash:
+    environment:
+      RELEASE_NAME: "zerohash"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_zerohash
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  wexinc:
+    environment:
+      RELEASE_NAME: "wexinc"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_wexinc
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  yugabyte:
+    environment:
+      RELEASE_NAME: "yugabyte"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_yugabyte
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  clearcapital:
+    environment:
+      RELEASE_NAME: "clearcapital"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_clearcapital
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  kudos:
+    environment:
+      RELEASE_NAME: "kudos"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_kudos
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  sayrhino:
+    environment:
+      RELEASE_NAME: "sayrhino"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-b
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-b_sayrhino
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  bettercloud:
+    environment:
+      RELEASE_NAME: "bettercloud"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_bettercloud
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  hotjar:
+    environment:
+      RELEASE_NAME: "hotjar"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_hotjar
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  faros:
+    environment:
+      RELEASE_NAME: "faros"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_faros
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  metronome:
+    environment:
+      RELEASE_NAME: "metronome"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_metronome
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  enlighted:
+    environment:
+      RELEASE_NAME: "enlighted"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_enlighted
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  instabase:
+    environment:
+      RELEASE_NAME: "instabase"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_instabase
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  dingo:
+    environment:
+      RELEASE_NAME: "dingo"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_dingo
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  konghq:
+    environment:
+      RELEASE_NAME: "konghq"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_konghq
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  kraken:
+    environment:
+      RELEASE_NAME: "kraken"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_kraken
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  appdynamics:
+    environment:
+      RELEASE_NAME: "appdynamics"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_appdynamics
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  gemini:
+    environment:
+      RELEASE_NAME: "gemini"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_gemini
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  morganstanley:
+    environment:
+      RELEASE_NAME: "morganstanley"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_morganstanley
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  datastax:
+    environment:
+      RELEASE_NAME: "datastax"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_datastax
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  foxnews:
+    environment:
+      RELEASE_NAME: "foxnews"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_foxnews
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  addeparcirt:
+    environment:
+      RELEASE_NAME: "addeparcirt"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_addeparcirt
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  siemens-bri:
+    environment:
+      RELEASE_NAME: "siemens-bri"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_siemens-bri
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  chippercash:
+    environment:
+      RELEASE_NAME: "chippercash"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_chippercash
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  simplisafe:
+    environment:
+      RELEASE_NAME: "simplisafe"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_simplisafe
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  rapid7:
+    environment:
+      RELEASE_NAME: "rapid7"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_rapid7
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  machinify:
+    environment:
+      RELEASE_NAME: "machinify"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_machinify
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  payward:
+    environment:
+      RELEASE_NAME: "payward"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_payward
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  stukent:
+    environment:
+      RELEASE_NAME: "stukent"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_stukent
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  thoughtspot:
+    environment:
+      RELEASE_NAME: "thoughtspot"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_thoughtspot
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  autonomic:
+    environment:
+      RELEASE_NAME: "autonomic"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_us-central1_prod-us-central1-private-c
+      INSTANCE_VALUES_DIR: gke_prod-us-central1-private-c_autonomic
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: us-central1
+      CLUSTER_IP: 172.16.4.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  iwconnect:
+    environment:
+      RELEASE_NAME: "iwconnect"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_iwconnect
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  deliveroo:
+    environment:
+      RELEASE_NAME: "deliveroo"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_deliveroo
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  adarga:
+    environment:
+      RELEASE_NAME: "adarga"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_adarga
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  dazn:
+    environment:
+      RELEASE_NAME: "dazn"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_dazn
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  cazoo:
+    environment:
+      RELEASE_NAME: "cazoo"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_cazoo
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  addepar2:
+    environment:
+      RELEASE_NAME: "addepar2"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_addepar2
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  blockdaemon:
+    environment:
+      RELEASE_NAME: "blockdaemon"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_blockdaemon
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  platformsh:
+    environment:
+      RELEASE_NAME: "platformsh"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_platformsh
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  europe-test:
+    environment:
+      RELEASE_NAME: "europe-test"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
+      INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_europe-test
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: europe-west4
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  navi:
+    environment:
+      RELEASE_NAME: "navi"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_asia-northeast1_prod-asia-northeast1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-asia-northeast1-private-a_navi
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: asia-northeast1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  blinkit:
+    environment:
+      RELEASE_NAME: "blinkit"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_asia-northeast1_prod-asia-northeast1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-asia-northeast1-private-a_blinkit
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: asia-northeast1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  healthifyme:
+    environment:
+      RELEASE_NAME: "healthifyme"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_asia-northeast1_prod-asia-northeast1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-asia-northeast1-private-a_healthifyme
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: asia-northeast1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+  asia-test:
+    environment:
+      RELEASE_NAME: "asia-test"
+      KUBE_CLUSTER_ENTRY: gke_blameless-185322_asia-northeast1_prod-asia-northeast1-private-a
+      INSTANCE_VALUES_DIR: gke_prod-asia-northeast1-private-a_asia-test
+      CLUSTER_ENV: prod
+      PROVIDER: gcp
+      CLUSTER_REGION: asia-northeast1
+      CLUSTER_IP: 172.16.0.2
+      CLUSTER_PORT: 1337
+    <<: *deploy_private
+
+  # Webhook to Blameless changestream
+  # TODO(KMG): Move to separate script
+  webhook_to_blameless:
+    <<: *default_executor
+    steps:
+      - run:
+          command: |
+            echo '{}' | jq '{
+               "build_num": env.CIRCLE_BUILD_NUM,
+               "branch": env.CIRCLE_BRANCH,
+               "username": env.CIRCLE_USERNAME,
+               "job": env.CIRCLE_JOB,
+               "data": env.CIRCLE_TAG,
+               "build_url": env.CIRCLE_BUILD_URL,
+               "vcs_revision": env.CIRCLE_SHA1,
+               "reponame": env.CIRCLE_PROJECT_REPONAME,
+               "workflow_id": env.CIRCLE_WORKFLOW_ID,
+               "workflow_url": ("https://circleci.com/workflow-run/" + env.CIRCLE_WORKFLOW_ID),
+               "pull_request": env.CI_PULL_REQUEST,
+               "user": env.CIRCLE_USERNAME,
+               "api_link":("https://circleci.com/api/v1.1/project/" + env.CIRCLE_PROJECT_USERNAME + "/" + env.CIRCLE_PROJECT_REPONAME + "/" + env.CIRCLE_BUILD_NUM),
+               "status":"unknown"
+             }' > /tmp/raw-webhook.json
+          name: Bundle build info into webhook payload
+          when: always
+      - run:
+          command: |
+            cat /tmp/raw-webhook.json | jq '.status="success"' > /tmp/webhook.json
+            curl -X POST -H"Content-Type:application/json" -d @/tmp/webhook.json $BLAMELESS_CIRCLECI_WEBHOOK || true
+          name: Notify Webhook Success with Success Webhook
+          when: on_success
+      - run:
+          command: |-
+            cat /tmp/raw-webhook.json | jq '.status="failed"'  > /tmp/webhook.json
+            curl -X POST -H"Content-Type:application/json" -d @/tmp/webhook.json $BLAMELESS_CIRCLECI_WEBHOOK || true
+          name: Notify Webhook Failure with Failure Webhook
+          when: on_fail
+
+  webhook_to_E2E:
+    <<: *default_executor
+    steps:
+      - blameless-cicd/configure-gcloud
+      - run:
+          command: |
+            curl --location --request POST 'https://circleci.com/api/v2/project/github/blamelesshq/e2e-tests/pipeline' \
+            --header 'Content-Type: application/json' \
+            -u "${E2E_CIRCLECI_TOKEN}:"
+          name: Run E2E test
+          when: always
+
+###
+# Workflow definitions
+###
+workflows:
+  version: 2.1
+
+  deploy_mt_proxy:
+    when: << pipeline.parameters.deploy_mt_proxy >>
+    jobs:
+      - sumologic/workflow-collector
+      - multitenant-mt-proxy-dev-a:
+          context: ci_builds
+      - multitenant-mt-proxy-dev-multitenant:
+          context: ci_builds
+      - hold-mt-proxy-prod:
+          <<: *hold_mt_proxy_wf_defaults
+      - multitenant-mt-proxy-prod-a:
+          <<: *mt_proxy_wf_defaults
+      - multitenant-mt-proxy-prod-b:
+          <<: *mt_proxy_wf_defaults
+      - multitenant-mt-proxy-prod-c:
+          <<: *mt_proxy_wf_defaults
+      - multitenant-mt-proxy-prod-europe-west4-a:
+          <<: *mt_proxy_wf_defaults
+      - multitenant-mt-proxy-prod-asia-northeast1-a:
+          <<: *mt_proxy_wf_defaults
+
+  deploy_mt_service:
+    when: << pipeline.parameters.deploy_mt_service >>
+    jobs:
+      - sumologic/workflow-collector
+      - multitenant-service-dev:
+          context: ci_builds
+      - hold-mt-prod:
+          <<: *hold_mt_service_wf_defaults
+      - multitenant-service-prod-us-central1:
+          <<: *mt_service_wf_defaults
+      - multitenant-service-prod-europe-west4:
+          <<: *mt_service_wf_defaults
+      - multitenant-service-prod-asia-northeast1:
+          <<: *mt_service_wf_defaults
+
+  deploy_devcommon:
+    when:
+      not:
+        matches:
+          pattern: "^master$"
+          value: << pipeline.git.branch >>
+    jobs:
+      - sumologic/workflow-collector
+      - test_helm_versions:
+          context: ci_builds
+      - hold-devcommon0:
+          <<: *hold_devcommon0_wf_defaults
+      - hold-devcommon1:
+          <<: *hold_devcommon1_wf_defaults
+      - hold-devcommon2:
+          <<: *hold_devcommon2_wf_defaults
+      - hold-devcommon3:
+          <<: *hold_devcommon3_wf_defaults
+      - hold-devcommon4:
+          <<: *hold_devcommon4_wf_defaults
+      - hold-devcommon5:
+          <<: *hold_devcommon5_wf_defaults
+      - hold-devcommon6:
+          <<: *hold_devcommon6_wf_defaults
+      - devcommon-0:
+          <<: *devcommon0_wf_defaults
+      - devcommon-1:
+          <<: *devcommon1_wf_defaults
+      - devcommon-2:
+          <<: *devcommon2_wf_defaults
+      - devcommon-3:
+          <<: *devcommon3_wf_defaults
+      - devcommon-4:
+          <<: *devcommon4_wf_defaults
+      - devcommon-5:
+          <<: *devcommon5_wf_defaults
+      - devcommon-6:
+          <<: *devcommon6_wf_defaults
+
+  test_and_deploy:
+    unless:
+      or:
+        - << pipeline.parameters.deploy_mt_service >>
+        - << pipeline.parameters.deploy_mt_proxy >>
+    jobs:
+      - sumologic/workflow-collector
+      # Vallidate version config
+      - test_helm_versions:
+          context: ci_builds
+
+      # Dev instances
+      - blamelesstrial:
+          <<: *dev_wf_defaults
+      - blamelessdev:
+          <<: *dev_wf_defaults
+      - testautomation:
+          <<: *dev_wf_defaults
+      - webhook_to_E2E:
+          context: ci_builds
+          requires:
+            - testautomation
+      - mt-testing:
+          <<: *dev_wf_defaults
+      - msteams:
+          <<: *dev_wf_defaults
+
+      # Holds required for manual approval
+      - hold:
+          <<: *hold_wf_defaults
+      - hold-ha:
+          <<: *hold_ha_wf_defaults
+      - hold-cre:
+          <<: *hold_cre_wf_defaults
+      - hold-blameless:
+          <<: *hold_blameless_wf_defaults
+
+      # Prod clusters
+      - blameless:
+          <<: *blameless_wf_defaults
+      - blamelesscre:
+          <<: *cre_wf_defaults
+      - iterable:
+          <<: *prod_wf_defaults_ha
+      - masterclass:
+          <<: *prod_wf_defaults
+      - packet:
+          <<: *prod_wf_defaults
+      - platform9:
+          <<: *prod_wf_defaults
+      - procore:
+          <<: *prod_wf_defaults_ha
+      - tenable:
+          <<: *prod_wf_defaults_ha
+      - homedepot:
+          <<: *prod_wf_defaults_ha
+      - flywire:
+          <<: *prod_wf_defaults_ha
+      - vestiairecollective: 
+          <<: *prod_wf_defaults_ha
+      - underarmour:
+          <<: *prod_wf_defaults
+      - datarobot:
+          <<: *prod_wf_defaults_ha
+      - mambu:
+          <<: *prod_wf_defaults
+      - addepar:
+          <<: *prod_wf_defaults
+      - earnin:
+          <<: *prod_wf_defaults
+      - acs:
+          <<: *prod_wf_defaults_ha
+      - missionlane:
+          <<: *prod_wf_defaults
+      - citrix:
+          <<: *prod_wf_defaults_ha
+      - mercari-sandbox:
+          <<: *prod_wf_defaults
+      - mercari:
+          <<: *prod_wf_defaults
+      - gojek:
+          <<: *prod_wf_defaults
+      - softwareag:
+          <<: *prod_wf_defaults
+      - sostronk:
+          <<: *prod_wf_defaults
+      - greenlight:
+          <<: *prod_wf_defaults
+      - gremlin:
+          <<: *prod_wf_defaults
+      - zapier:
+          <<: *prod_wf_defaults_ha
+      - inloco:
+          <<: *prod_wf_defaults
+      - mux:
+          <<: *prod_wf_defaults
+      - flatiron:
+          <<: *prod_wf_defaults
+      - hashicorp:
+          <<: *prod_wf_defaults
+      - revops:
+          <<: *prod_wf_defaults
+      - zoopla:
+          <<: *prod_wf_defaults
+      - fast:
+          <<: *prod_wf_defaults
+      - hitachisolutions:
+          <<: *prod_wf_defaults
+      - ticketmaster:
+          <<: *prod_wf_defaults
+      - gtm-blameless:
+          <<: *prod_wf_defaults
+      - codeclimate:
+          <<: *prod_wf_defaults
+      - leolabs:
+          <<: *prod_wf_defaults
+      - salesboomerang:
+          <<: *prod_wf_defaults
+      - microsoft:
+          <<: *prod_wf_defaults
+      - vimeo:
+          <<: *prod_wf_defaults
+      - phreesia:
+          <<: *prod_wf_defaults
+      - galaxydigital:
+          <<: *prod_wf_defaults
+      - paypay:
+          <<: *prod_wf_defaults
+      - snyk:
+          <<: *prod_wf_defaults
+      - fox:
+          <<: *prod_wf_defaults
+      - eventbrite:
+          <<: *prod_wf_defaults
+      - demo:
+          <<: *prod_wf_defaults
+      - crowdstrike:
+          <<: *prod_wf_defaults
+      - markley:
+          <<: *prod_wf_defaults
+      - afterpay:
+          <<: *prod_wf_defaults
+      - cultureamp:
+          <<: *prod_wf_defaults
+      - petalcard:
+          <<: *prod_wf_defaults
+      - paloaltonetworks:
+          <<: *prod_wf_defaults
+      - stitchfix:
+          <<: *prod_wf_defaults
+      - dremio:
+          <<: *prod_wf_defaults
+      - sadapay:
+          <<: *prod_wf_defaults
+      - glovoapp:
+          <<: *prod_wf_defaults
+      - load-test:
+          <<: *prod_wf_defaults
+      - myfitnesspal:
+          <<: *prod_wf_defaults
+      - rainbowq:
+          <<: *prod_wf_defaults
+      - benevity:
+          <<: *prod_wf_defaults
+      - agero:
+          <<: *prod_wf_defaults
+      - newrelic:
+          <<: *prod_wf_defaults
+      - sezzle:
+          <<: *prod_wf_defaults
+      - delixus:
+          <<: *prod_wf_defaults
+      - ifood:
+          <<: *prod_wf_defaults
+      - bolt:
+          <<: *prod_wf_defaults
+      - fieldnation:
+          <<: *prod_wf_defaults
+      - vmware:
+          <<: *prod_wf_defaults
+      - att:
+          <<: *prod_wf_defaults
+      - sailpoint:
+          <<: *prod_wf_defaults
+      - sleuth:
+          <<: *prod_wf_defaults
+      - zerohash:
+          <<: *prod_wf_defaults
+      - wexinc:
+          <<: *prod_wf_defaults
+      - yugabyte:
+          <<: *prod_wf_defaults
+      - clearcapital:
+          <<: *prod_wf_defaults
+      - kudos:
+          <<: *prod_wf_defaults
+      - sayrhino:
+          <<: *prod_wf_defaults
+      - bettercloud:
+          <<: *prod_wf_defaults
+      - hotjar:
+          <<: *prod_wf_defaults
+      - faros:
+          <<: *prod_wf_defaults
+      - metronome:
+          <<: *prod_wf_defaults
+      - adarga:
+          <<: *prod_wf_defaults
+      - dazn:
+          <<: *prod_wf_defaults
+      - cazoo:
+          <<: *prod_wf_defaults
+      - addepar2:
+          <<: *prod_wf_defaults
+      - blockdaemon:
+          <<: *prod_wf_defaults
+      - platformsh:
+          <<: *prod_wf_defaults
+      - enlighted:
+          <<: *prod_wf_defaults
+      - instabase:
+          <<: *prod_wf_defaults
+      - dingo:
+          <<: *prod_wf_defaults
+      - konghq:
+          <<: *prod_wf_defaults
+      - kraken:
+          <<: *prod_wf_defaults
+      - appdynamics:
+          <<: *prod_wf_defaults
+      - gemini:
+          <<: *prod_wf_defaults
+      - morganstanley:
+          <<: *prod_wf_defaults
+      - datastax:
+          <<: *prod_wf_defaults
+      - iwconnect:
+          <<: *prod_wf_defaults
+      - deliveroo:
+          <<: *prod_wf_defaults
+      - foxnews:
+          <<: *prod_wf_defaults
+      - addeparcirt:
+          <<: *prod_wf_defaults
+      - siemens-bri:
+          <<: *prod_wf_defaults
+      - chippercash:
+          <<: *prod_wf_defaults
+      - simplisafe:
+          <<: *prod_wf_defaults
+      - rapid7:
+          <<: *prod_wf_defaults
+      - machinify:
+          <<: *prod_wf_defaults
+      - payward:
+          <<: *prod_wf_defaults
+      - stukent:
+          <<: *prod_wf_defaults
+      - thoughtspot:
+          <<: *prod_wf_defaults
+      - autonomic:
+          <<: *prod_wf_defaults
+      - navi:
+          <<: *prod_wf_defaults
+      - blinkit:
+          <<: *prod_wf_defaults
+      - healthifyme:
+          <<: *prod_wf_defaults
+      - europe-test:
+          <<: *prod_wf_defaults
+      - asia-test:
+          <<: *prod_wf_defaults
