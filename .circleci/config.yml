@@ -8,7 +8,7 @@ jobs:
       - checkout
       - run:
           name: Message
-          command: node -v
+          command: nodejs -v
 
 workflows:
   version: 2
