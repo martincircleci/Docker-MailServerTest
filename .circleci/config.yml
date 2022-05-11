@@ -11,6 +11,7 @@ jobs:
           command: node --version
 
 workflows:
+  version: 2
   sample:
     jobs:
       - build-and-test
