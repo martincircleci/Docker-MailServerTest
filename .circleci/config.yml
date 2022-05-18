@@ -8,8 +8,8 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Message
-          command: echo "Looking for previous build"
+          name: Looking for previous build with workspace
+          command: echo ${CIRCLE_WORKFLOW_WORKSPACE_ID}
 
 workflows:
   sample:
