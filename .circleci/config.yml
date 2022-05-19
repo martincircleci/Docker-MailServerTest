@@ -9,13 +9,9 @@ jobs:
       - checkout
       - run:
           name: Message
-          command: echo "Only Master"
+          command: echo "Only Master?"
 
 workflows:
   sample:
     jobs:
-      - build-and-test:
-          filters:
-            branches:
-              only:
-                - master
+      - build-and-test
