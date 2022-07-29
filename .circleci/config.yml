@@ -2025,7 +2025,7 @@ jobs:
     <<: *deploy_private
   dazn:
     environment:
-      RELEASE_NAME: "dazn"
+      RELEASE_NAME: "daznt"
       KUBE_CLUSTER_ENTRY: gke_blameless-185322_europe-west4_prod-europe-west4-private-a
       INSTANCE_VALUES_DIR: gke_prod-europe-west4-private-a_dazn
       CLUSTER_ENV: prod
