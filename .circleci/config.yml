@@ -11,6 +11,8 @@ jobs:
       - run:
           name: Do it
           command: echo "Do it"
+      - run:
+          command: echo ${CIRCLE_NODE_INDEX}
 
 workflows:
   sample:
