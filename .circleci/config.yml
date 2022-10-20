@@ -3,8 +3,7 @@ version: 2.1
 jobs:
   build-and-test:
     machine:
-      image: circleci/classic:201707-01
-      docker_layer_caching: true
+      image: android:2022.08.1
 
     steps:
       - checkout
