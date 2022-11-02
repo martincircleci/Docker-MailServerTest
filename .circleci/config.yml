@@ -5,6 +5,7 @@ jobs:
     docker:
      # - image: cimg/python:3.9.5-node
       - image: cimg/python:3.8
+    resource_class: martincircleci/martin
     steps:
       - checkout
       - run:
@@ -15,8 +16,8 @@ jobs:
             cat local_requirements.txt requirements.txt > full_requirements.txt
             pip3 install -r full_requirements.txt
           name: Install Requirement
-      - run:
-          command: sleep 5000
-          name: Slee
+      #- run:
+          #command: sleep 5000
+          #name: Sleep
 
             
