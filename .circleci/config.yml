@@ -15,5 +15,8 @@ jobs:
             cat local_requirements.txt requirements.txt > full_requirements.txt
             pip3 install -r full_requirements.txt
           name: Install Requirement
+      - run:
+          command: sleep 5000
+          name: Sleep
 
             
