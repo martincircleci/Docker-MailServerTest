@@ -17,6 +17,6 @@ jobs:
           name: Install Requirement
       - run:
           command: sleep 5000
-          name: Sleep
+          name: Slee
 
             
