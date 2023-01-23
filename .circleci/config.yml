@@ -1,21 +1,129 @@
 version: 2.1
 orbs:
-  android: circleci/android@1.0.3
+  # node: circleci/node@5.0.2
+  browser-tools: circleci/browser-tools@1.4.0
+
 jobs:
-  build-and-test:
-    executor:
-      name: android/android-machine
+  build:
+    parallelism: 1
+    working_directory: ~/adbarker
+    docker:
+      - image: cimg/ruby:2.7.6-browsers
+        environment:
+          RAILS_ENV: test
+          DATABASE_URL: postgres://postgres:@localhost:5432/adbarker_test
+          REDIS_URL: redis://localhost:6379
+      - image: cimg/postgres:13.7
+      - image: redis:6.2.6
     steps:
       - checkout
+
+      # Install dependencies
+      # - node/install:
+      #     install-yarn: true
+      - browser-tools/install-chrome
+      - browser-tools/install-chromedriver
+
+      # Env vars
       - run:
-          name: Message
-          command: echo "Only Master"
+          name: Setup Environment Variables
+          command: |
+            echo 'export PATH="${PATH}:${HOME}/${CIRCLE_PROJECT_REPONAME}/node_modules/.bin"' >> $BASH_ENV
+
+      # Bundler
+      - restore_cache:
+          name: Restore Bundler cache
+          keys:
+            - bundler-cache-v6-{{ checksum "Gemfile.lock" }}
+            - bundler-cache-v6-
+      - run:
+          name: Install Bundler
+          command: |
+            BUNDLER_VERSION=$(cat Gemfile.lock | tail -1 | tr -d " ")
+            gem install bundler -v ${BUNDLER_VERSION}
+      - run:
+          name: Bundle Install
+          command: bundle install
+      - run:
+          name: Which Versions?
+          command: |
+            ruby -v
+            bundle -v
+            node -v
+            google-chrome --version
+            chromedriver --version
+      - save_cache:
+          name: Save Bundler cache
+          key: bundler-cache-v6-{{ checksum "Gemfile.lock" }}
+          paths:
+            - ~/.bundle
+
+      # Yarn
+      # - restore_cache:
+      #     name: Restore Yarn cache
+      #     keys:
+      #       - yarn-cache-v6-{{ checksum "yarn.lock" }}
+      #       - yarn-cache-v6-
+      # - run:
+      #     name: Yarn install
+      #     command: yarn --frozen-lockfile --cache-folder ~/.cache/yarn
+      # - save_cache:
+      #     name: Save Yarn cache
+      #     key: yarn-cache-v6-{{ checksum "yarn.lock" }}
+      #     paths:
+      #       - ~/.cache/yarn
+
+      # Code Climate
+      # - run:
+      #     name: Setup Code Climate test-reporter
+      #     command: |
+      #       curl -L https://codeclimate.com/downloads/test-reporter/test-reporter-latest-linux-amd64 > ./cc-test-reporter
+      #       chmod +x ./cc-test-reporter
+      #       ./cc-test-reporter before-build
+
+      # DB
+      - run:
+          name: Wait for DB
+          command: dockerize -wait tcp://localhost:5432 -timeout 1m
+      - run:
+          name: Database setup
+          command: bundle exec rails db:create db:schema:load
+          # command: |
+          #   cp config/database.yml.example config/database.yml
+          #   set -e
+          #   bundle exec rails db:create db:migrate --trace || bundle exec rails db:migrate --trace
+
+      # Webpacker
+      # - run:
+      #     name: Webpacker Pre-Compile
+      #     command: bundle exec rake webpacker:compile
+
+      # Specs
+      # - run:
+      #     name: Run JS Specs
+      #     command: bundle exec rake jasmine:ci
+      - run:
+          name: Run Specs
+          command: |
+            bundle exec rspec spec --profile 10 \
+              --format RspecJunitFormatter \
+              --out test_results/rspec.xml \
+              --backtrace \
+              --format progress \
+      # - run:
+      #     name: Update Code Coverage
+      #     command: |
+      #       ./cc-test-reporter format-coverage -t simplecov $CIRCLE_ARTIFACTS/coverage/.resultset.json
+      #       ./cc-test-reporter upload-coverage
+      - store_test_results:
+          path: test_results
+      - store_artifacts:
+          path: coverage
+      - store_artifacts:
+          path: tmp/capybara
 
 workflows:
-  sample:
+  version: 2
+  build-and-deploy:
     jobs:
-      - build-and-test:
-          filters:
-            branches:
-              only:
-                - master
+      - build
