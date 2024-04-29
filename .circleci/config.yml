@@ -1,21 +1,34 @@
 version: 2.1
-orbs:
-  android: circleci/android@1.0.3
+
+executors:
+  deploy_image:
+    docker:
+      - image: ${AWS_ACCOUNT_NUMBER}.dkr.ecr.${ECR_AWS_REGION}.amazonaws.com/${ENVIRONMENT}/circlecipython-image/python311:latest
+        aws_auth:
+          aws_access_key_id: $AWS_ERC_ACCESS_KEY
+          aws_secret_access_key: $AWS_ERC_SECRET_KEY
+
 jobs:
-  build-and-test:
-    executor:
-      name: android/android-machine
+  deploy:
+    executor: deploy_image
+    parameters:
+      lambda:
+        type: string
     steps:
-      - checkout
-      - run:
-          name: Message
-          command: echo "Only Master"
+      - attach_workspace:
+          at: ~/
+      - run: deploy_function.py --function << parameters.lambda >>
 
 workflows:
-  sample:
+  production-environment:
     jobs:
-      - build-and-test:
+      - deploy:
+          context: prod-aws-app-circleci
           filters:
             branches:
               only:
                 - master
+          name: "deploy-<< matrix.lambda >>"
+          matrix:
+            parameters:
+              lambda: [ monitor ]
