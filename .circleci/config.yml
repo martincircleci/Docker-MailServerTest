@@ -1,6 +1,6 @@
 version: 2.1
 orbs:
-  android: circleci/android@1.0.3
+  android: circleci/android@1.0.2
 jobs:
   build-and-test:
     executor:
@@ -8,7 +8,7 @@ jobs:
     steps:
       - checkout
       - run:
-          name: Store Google Services Key
+          name: Message
           command: echo "Only Master"
 
 workflows:
